@@ -1,84 +1,87 @@
-# 🤖 AI Telegram Community Q&A Bot (n8n Workflow)
+# n8n Telegram Community Q&A Bot
 
-An automated community support Q&A bot built on **n8n**, powered by an **auto-learning Knowledge Base (KB)** and **NVIDIA NIM LLM & Vision models**.
-
----
-
-## 📌 Executive Summary
-
-This workflow automatically answers questions posted in Telegram groups/channels. It minimizes AI API costs by maintaining a local Knowledge Base table of past answered questions using fuzzy keyword matching. If a question is not found in the Knowledge Base, it uses NVIDIA NIM AI models (Nemotron for text and Llama 3.2 Vision for images) to generate a full response and saves the result back into the Knowledge Base for zero-cost future reuse.
+An automated Q&A workflow for Telegram communities built using n8n. It uses a local database table as a first-line cache to answer frequent questions instantly, falling back to NVIDIA LLMs (Nemotron for text, Llama 3.2 for images) only when new questions are asked.
 
 ---
 
-## 🌟 Key Features
+## Overview
 
-* **⚡ 0-Token Cost Instant Answers**: Checks the n8n `qa_knowledge_base` table using keyword similarity ($\ge 0.62$). Instant replies for recurring questions.
-* **🧠 Auto-Learning Memory**: Fresh AI answers are automatically ingested into the Knowledge Base for future user queries.
-* **📷 Vision / Image Processing**: Accepts photos/screenshots of technical problems or exam questions and diagnoses them using `meta/llama-3.2-90b-vision-instruct`.
-* **🔒 Secure Long Polling**: Polls Telegram via `getUpdates` every 30s—no public HTTP endpoints, webhooks, or open ports required.
-* **💬 Intelligent Message Handling**: Splits long answers (>3800 characters) into threaded multi-part Telegram messages (`1/2`, `2/2`).
+Managing support in active Telegram groups can be repetitive. This workflow reduces API costs and response times by storing answered questions in an n8n Data Table. 
+
+When a user posts a question or screenshot:
+1. The workflow normalizes the message and checks the local database using keyword matching.
+2. If a matching question exists, it replies with the stored answer immediately.
+3. If no match is found, it sends the query to the NVIDIA NIM API.
+4. The new AI answer is sent back to Telegram and saved to the database so future queries can use it without making another API call.
 
 ---
 
-## 🏗️ Architecture & Data Flow
+## System Architecture
 
 ```mermaid
 flowchart TD
-    A[Telegram Group / Channel User] -->|Sends question / photo| B(n8n Schedule Trigger - Every 30s)
-    B --> C[Get Telegram Updates - Long Poll]
-    C --> D{Is Addressed & Valid Question?}
-    D -->|No| E[Ignore / Skip]
-    D -->|Yes| F[Send Typing Action]
-    F --> G{Search qa_knowledge_base}
+    A[Telegram User] -->|Posts question or photo| B[n8n Schedule Trigger]
+    B --> C[Get Updates via Long Polling]
+    C --> D{Valid Question?}
+    D -->|No| E[Ignore Message]
+    D -->|Yes| F[Send Typing Indicator]
+    F --> G{Check Local Database}
     
-    G -->|Match Score >= 0.62| H[Format Stored KB Answer]
-    G -->|No Match| I{Contains Image?}
+    G -->|Match Found| H[Format Stored Answer]
+    G -->|No Match| I{Contains Photo?}
     
-    I -->|Yes| J[NVIDIA Vision: Llama 3.2 90B]
-    I -->|No| K[NVIDIA Text: Llama 3.3 Nemotron 49B]
+    I -->|Yes| J[NVIDIA Llama 3.2 90B Vision]
+    I -->|No| K[NVIDIA Llama 3.3 Nemotron 49B]
     
-    J --> L[Parse AI Response]
+    J --> L[Parse Response]
     K --> L
-    L --> M[Save New Q&A to qa_knowledge_base]
+    L --> M[Save to Database]
     
-    H --> N[Split Long Message if > 4000 chars]
+    H --> N[Split Message if > 3800 Chars]
     M --> N
-    N --> O[Send Threaded Reply to Telegram]
+    N --> O[Send Reply to Telegram]
 ```
 
 ---
 
-## 🛠️ Stack & Technical Specifications
+## Key Design Considerations
 
-| Component | Technology | Description |
-| :--- | :--- | :--- |
-| **Workflow Engine** | [n8n](https://n8n.io/) | Workflow automation and node routing |
-| **Workflow File** | [`workflow.json`](./workflow.json) | Complete n8n workflow definition |
-| **Local Knowledge Base** | n8n `dataTable` | `qa_knowledge_base` with Jaccard keyword matching |
-| **Text LLM** | NVIDIA NIM `nvidia/llama-3.3-nemotron-super-49b-v1` | Fast, accurate Q&A model |
-| **Vision LLM** | NVIDIA NIM `meta/llama-3.2-90b-vision-instruct` | Image & screenshot Q&A model |
-| **Target Bot Handle** | `@nexushelper421bot` | Default configured Telegram bot handle |
+- Local Caching: Questions are evaluated against existing entries using Jaccard keyword similarity (threshold >= 0.62). High-confidence matches bypass LLM API calls entirely.
+- Vision Support: Photos and screenshots attached to messages are sent to a vision model (Llama 3.2 90B) to handle visual questions.
+- Long Polling Security: The bot uses Telegram's getUpdates method rather than webhooks, so n8n does not need a public IP address or open inbound ports.
+- Message Splitting: Replies exceeding Telegram's 4096-character limit are automatically split across multiple numbered messages (e.g. 1/2, 2/2) along paragraph boundaries.
 
 ---
 
-## 🚀 How to Import into n8n
+## Stack Details
 
-1. Download or clone this repository.
-2. In your n8n dashboard, go to **Workflows** → **Import from File**.
-3. Select `workflow.json`.
+- Automation Platform: n8n
+- Workflow File: workflow.json
+- Data Store: n8n Data Tables (qa_knowledge_base)
+- Text Model: NVIDIA NIM (nvidia/llama-3.3-nemotron-super-49b-v1)
+- Vision Model: NVIDIA NIM (meta/llama-3.2-90b-vision-instruct)
+- Telegram Handle: @nexushelper421bot
 
 ---
 
-## ⚙️ Deployment & Environment Setup
+## Setup and Installation
 
-Run n8n with the required environment variables:
+1. Import the Workflow:
+   - Open n8n.
+   - Go to Workflows -> Import from File.
+   - Select workflow.json.
 
-```bash
-N8N_BLOCK_ENV_ACCESS_IN_NODE=false \
-TELEGRAM_BOT_TOKEN="<YOUR_TELEGRAM_BOT_TOKEN>" \
-n8n start
-```
+2. Create the Database Table:
+   - Run the "Create KB Table" node once to set up the qa_knowledge_base table structure.
 
-### Credentials Required in n8n
-- **Telegram API Credential**: Bound to Telegram nodes.
-- **Header Auth Credential (NVIDIA NIM)**: `Authorization: Bearer nvapi-xxxxxxxxxxxx`.
+3. Environment Variables:
+   Set the following environment variables when starting n8n:
+
+   ```bash
+   N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+   TELEGRAM_BOT_TOKEN=<your_bot_token>
+   ```
+
+4. Credentials Setup:
+   - Configure a Telegram API credential in n8n.
+   - Configure a Header Auth credential for NVIDIA NIM (Header Name: Authorization, Value: Bearer nvapi-...).
