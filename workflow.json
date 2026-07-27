@@ -1,0 +1,1089 @@
+{
+  "id": "y5T78eObq169WBRJ",
+  "name": "AI Telegram Community Q&A Bot",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "1dd6ebe4-2cb9-403c-a4ad-852d5ce1239c",
+      "name": "▶ Click here once, first time only",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -460,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "table",
+        "operation": "create",
+        "tableName": "qa_knowledge_base",
+        "columns": {
+          "column": [
+            {
+              "name": "question",
+              "type": "string"
+            },
+            {
+              "name": "question_key",
+              "type": "string"
+            },
+            {
+              "name": "answer",
+              "type": "string"
+            },
+            {
+              "name": "keywords",
+              "type": "string"
+            },
+            {
+              "name": "source",
+              "type": "string"
+            },
+            {
+              "name": "hits",
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d2ecfa41-2b79-417b-8a3f-ddc29079af82",
+      "name": "Create KB Table",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        -240,
+        -60
+      ],
+      "notes": "Creates the qa_knowledge_base data table. Run once, then never again."
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "seconds",
+              "secondsInterval": 30
+            }
+          ]
+        }
+      },
+      "id": "8e400158-dd2a-45f6-9cf1-fd6cdb1180ce",
+      "name": "Every 30 Seconds",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -1120,
+        300
+      ],
+      "notes": "Each tick long-polls Telegram for up to 25s, so replies feel instant."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Telegram keeps undelivered updates for 24h and hands them out from an offset.\n// Static data persists between production runs, so we resume where we left off.\nconst state = $getWorkflowStaticData('global');\nreturn [{ json: { offset: Number(state.telegramOffset ?? 0) } }];"
+      },
+      "id": "9a57dca4-dbdc-4986-a242-ed8a1f1369a5",
+      "name": "Read Saved Offset",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -900,
+        300
+      ],
+      "notes": "Remembers which updates were already handled, across restarts."
+    },
+    {
+      "parameters": {
+        "url": "=https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/getUpdates",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "offset",
+              "value": "={{ $json.offset }}"
+            },
+            {
+              "name": "limit",
+              "value": "1"
+            },
+            {
+              "name": "timeout",
+              "value": "25"
+            },
+            {
+              "name": "allowed_updates",
+              "value": "[\"message\",\"channel_post\"]"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 40000
+        }
+      },
+      "id": "579d53aa-4496-4cab-a74f-0e7aaaf34307",
+      "name": "Get Telegram Updates",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -680,
+        300
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "notes": "Long poll. Needs TELEGRAM_BOT_TOKEN in n8n's environment."
+    },
+    {
+      "parameters": {
+        "jsCode": "const state = $getWorkflowStaticData('global');\nconst res = $input.first()?.json ?? {};\n\n// 409 = another getUpdates call is already open for this bot. Telegram allows only\n// one at a time, so just skip this tick quietly instead of logging a red failure.\nif (res.error_code === 409) {\n  return [];\n}\n\nif (res.ok !== true) {\n  const why = res.description ?? res.error?.message ?? res.error ?? 'no response from Telegram';\n  throw new Error(\n    'Could not read Telegram updates (' + why + '). Start n8n with '\n    + 'TELEGRAM_BOT_TOKEN=<your token> and N8N_BLOCK_ENV_ACCESS_IN_NODE=false.',\n  );\n}\n\nconst updates = Array.isArray(res.result) ? res.result : [];\nif (!updates.length) {\n  return [];  // nothing new - the run stops here\n}\n\nconst nextOffset = Math.max(...updates.map((u) => Number(u.update_id))) + 1;\nstate.telegramOffset = nextOffset;\n\n// Confirm with Telegram right now, before the slow part (the AI call). Otherwise an\n// overlapping poll could pick up the same question and answer it twice.\nconst token = $env.TELEGRAM_BOT_TOKEN;\nif (token) {\n  try {\n    await this.helpers.httpRequest({\n      method: 'GET',\n      url: 'https://api.telegram.org/bot' + token + '/getUpdates',\n      qs: { offset: nextOffset, limit: 1, timeout: 0 },\n      json: true,\n    });\n  } catch (error) {\n    // Confirmation is best-effort; the saved offset above already prevents repeats.\n  }\n}\n\nreturn updates.map((update) => ({ json: update }));"
+      },
+      "id": "be183a8d-f72d-4c98-9849-5870c1d47510",
+      "name": "Confirm & Emit Updates",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -460,
+        300
+      ],
+      "notes": "Confirms updates with Telegram immediately, so nothing is answered twice."
+    },
+    {
+      "parameters": {
+        "jsCode": "const STOPWORDS = new Set(['the','a','an','of','to','in','is','are','and','or','for','on','with','it','this',\n  'that','my','i','you','we','do','does','did','be','been','can','how','what','why','when','where','which',\n  'who','will','would','should','could','me','your','our','from','by','as','at','if','into','about','there',\n  'their','they','them','has','have','had','not','no','yes','please','any','some','also','than','then','so',\n  'such','using','use','used','get','got','need','want','know','tell','give','make','made']);\n\nfunction normalizeText(value) {\n  return String(value ?? '')\n    .toLowerCase()\n    .replace(/[^\\p{L}\\p{N}\\s]/gu, ' ')\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\nfunction keywordsOf(value) {\n  return normalizeText(value)\n    .split(' ')\n    .filter((word) => word.length > 2 && !STOPWORDS.has(word));\n}\n\n// Flattens a Telegram update into one predictable object and decides whether the\n// message is actually a question the bot should answer.\n//\n// The bot only answers when it is ADDRESSED: \"/ask ...\", an @mention, or a reply to\n// one of its own messages. Those three are exactly what Telegram delivers to a bot\n// whose privacy mode is ON, so this works without touching any BotFather setting.\n// If you later disable privacy mode (or make the bot a group admin), set\n// ANSWER_ANY_QUESTION to true and it will pick up questions with no prefix at all.\nconst BOT_USERNAME = 'nexushelper421bot';\nconst ANSWER_ANY_QUESTION = false;\n\nconst COMMAND_PREFIX = /^\\/(ask|q|question|help|support)(@[A-Za-z0-9_]+)?\\s*/i;\nconst QUESTION_STARTERS = /^(what|why|how|when|where|who|whom|whose|which|can|could|would|should|do|does|did|is|are|was|were|will|may|might|explain|define|describe|compare|contrast|calculate|solve|find|prove|derive|evaluate|list|state|name|difference|meaning)\\b/i;\nconst MIN_QUESTION_LENGTH = 8;\n\nconst results = [];\n\nfor (const item of $input.all()) {\n  const update = item.json ?? {};\n  const msg = update.message ?? update.edited_message ?? update.channel_post ?? {};\n  const chat = msg.chat ?? {};\n  const from = msg.from ?? {};\n\n  // Telegram sends every photo in several resolutions - keep the largest.\n  const photos = Array.isArray(msg.photo) ? msg.photo : [];\n  const largest = photos.length\n    ? photos.reduce((a, b) => ((b.file_size ?? b.width ?? 0) > (a.file_size ?? a.width ?? 0) ? b : a))\n    : null;\n\n  const rawText = String(msg.text ?? msg.caption ?? '').trim();\n  const mentionPattern = new RegExp('@' + BOT_USERNAME + '\\\\b', 'i');\n\n  const isCommand = COMMAND_PREFIX.test(rawText);\n  const mentionsBot = mentionPattern.test(rawText);\n  const isReplyToBot = Boolean(msg.reply_to_message?.from?.is_bot);\n\n  const question = rawText\n    .replace(COMMAND_PREFIX, '')\n    .replace(mentionPattern, '')\n    .trim();\n  const hasPhoto = Boolean(largest);\n\n  // Ignore Telegram/other-bot commands the bot was not asked to handle (/start, /rules...).\n  const isForeignCommand = rawText.startsWith('/') && !isCommand;\n\n  const looksLikeQuestion = hasPhoto\n    || question.endsWith('?')\n    || QUESTION_STARTERS.test(question);\n\n  // Addressed = the bot was spoken to directly. Telegram delivers these three even\n  // when privacy mode is on, so they always reach us.\n  const addressed = isCommand || mentionsBot || isReplyToBot;\n\n  const shouldProcess = !from.is_bot\n    && !isForeignCommand\n    && (addressed || (ANSWER_ANY_QUESTION && looksLikeQuestion))\n    && (question.length >= MIN_QUESTION_LENGTH || hasPhoto);\n\n  results.push({\n    json: {\n      updateId: update.update_id ?? null,\n      chatId: chat.id ?? null,\n      chatType: chat.type ?? 'private',\n      chatTitle: chat.title ?? null,\n      messageId: msg.message_id ?? null,\n      threadId: msg.message_thread_id ?? null,\n      userId: from.id ?? null,\n      userName: [from.first_name, from.last_name].filter(Boolean).join(' ') || from.username || 'there',\n      userHandle: from.username ? '@' + from.username : null,\n      rawText,\n      question: question || (hasPhoto\n        ? 'Read the question in this image and answer it.'\n        : ''),\n      questionKey: normalizeText(question),\n      keywords: keywordsOf(question).join(' '),\n      isCommand,\n      mentionsBot,\n      isReplyToBot,\n      addressed,\n      hasPhoto,\n      hasImage: false,\n      imageDataUrl: null,\n      fileId: largest ? largest.file_id : null,\n      isBot: Boolean(from.is_bot),\n      looksLikeQuestion,\n      shouldProcess,\n      receivedAt: new Date().toISOString(),\n    },\n  });\n}\n\nreturn results;"
+      },
+      "id": "9edfe46d-b22e-4600-8add-29a0e2e8559a",
+      "name": "Normalize Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -240,
+        300
+      ],
+      "notes": "Flattens the update and detects whether the message is a question."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "1b0a68b2-adda-4978-a629-0117b52bd8e6",
+              "leftValue": "={{ $json.shouldProcess }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "f0e61961-f195-48d6-9be8-ad626815bf43",
+      "name": "Is This a Question?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -20,
+        300
+      ],
+      "notes": "Answers questions only - chat, greetings and other bots are ignored."
+    },
+    {
+      "parameters": {},
+      "id": "124d1bf9-3afe-437b-9e5d-938059222ca9",
+      "name": "Not a Question - Ignore",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        200,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "sendChatAction",
+        "chatId": "={{ $json.chatId }}",
+        "action": "typing"
+      },
+      "id": "e1caf18d-6e1c-4bdf-91be-6c008b31c921",
+      "name": "Send Typing Action",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        200,
+        100
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "KpkZ9HKF5DscHg2o",
+          "name": "Telegram account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Shows 'bot is typing…' in the group."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "fa112d86-03a0-4be4-8525-d4303e0b5e5e",
+              "leftValue": "={{ $json.hasPhoto }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "207f73dd-4270-4c10-b266-fc59b082e4ef",
+      "name": "Has Photo?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "file",
+        "fileId": "={{ $json.fileId }}"
+      },
+      "id": "286b8ca1-d1b7-46dc-b8c8-0c493030ac55",
+      "name": "Download Telegram Photo",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        420,
+        180
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "KpkZ9HKF5DscHg2o",
+          "name": "Telegram account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "notes": "Downloads the highest-resolution version of the photo."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Converts the file downloaded from Telegram into a data URL the vision model accepts,\n// and re-attaches the message context (the Telegram file node returns binary only).\nconst ctx = $('Normalize Message').first().json;\nconst item = $input.first();\nconst binaryKeys = Object.keys(item.binary ?? {});\n\nlet imageDataUrl = null;\nlet mimeType = null;\nlet sizeKb = 0;\n\nif (binaryKeys.length) {\n  const key = binaryKeys[0];\n  const meta = item.binary[key];\n  mimeType = meta.mimeType || 'image/jpeg';\n\n  // meta.data is empty when n8n stores binaries on the filesystem / S3.\n  let base64 = meta.data;\n  if (!base64) {\n    const buffer = await this.helpers.getBinaryDataBuffer(0, key);\n    base64 = buffer.toString('base64');\n  }\n\n  sizeKb = Math.round(((base64.length * 3) / 4) / 1024);\n  imageDataUrl = 'data:' + mimeType + ';base64,' + base64;\n}\n\n// NVIDIA NIM only accepts inline base64 below ~180 KB; larger files need the NVCF\n// assets API. Rather than fail, fall back to answering from the caption alone.\nconst tooLarge = sizeKb > 175;\n\nreturn [{\n  json: {\n    ...ctx,\n    hasImage: Boolean(imageDataUrl) && !tooLarge,\n    imageDataUrl: tooLarge ? null : imageDataUrl,\n    imageMimeType: mimeType,\n    imageSizeKb: sizeKb,\n    imageSkippedReason: tooLarge ? 'image_exceeds_inline_base64_limit' : null,\n  },\n}];"
+      },
+      "id": "ffc387fc-125d-4e94-b93b-bf06ed5282fe",
+      "name": "Attach Image Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        180
+      ],
+      "notes": "Binary -> base64 data URL for the vision model."
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "qa_knowledge_base"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": []
+        },
+        "returnAll": true,
+        "options": {}
+      },
+      "id": "27822607-a36d-4cfc-92f1-6e4d86c2f704",
+      "name": "Search Knowledge Base",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        860,
+        300
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "notes": "Reads every stored Q&A row. Empty table on day one = always ask the AI."
+    },
+    {
+      "parameters": {
+        "jsCode": "const STOPWORDS = new Set(['the','a','an','of','to','in','is','are','and','or','for','on','with','it','this',\n  'that','my','i','you','we','do','does','did','be','been','can','how','what','why','when','where','which',\n  'who','will','would','should','could','me','your','our','from','by','as','at','if','into','about','there',\n  'their','they','them','has','have','had','not','no','yes','please','any','some','also','than','then','so',\n  'such','using','use','used','get','got','need','want','know','tell','give','make','made']);\n\nfunction normalizeText(value) {\n  return String(value ?? '')\n    .toLowerCase()\n    .replace(/[^\\p{L}\\p{N}\\s]/gu, ' ')\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\nfunction keywordsOf(value) {\n  return normalizeText(value)\n    .split(' ')\n    .filter((word) => word.length > 2 && !STOPWORDS.has(word));\n}\n\n// Fuzzy-matches the incoming question against every stored question in the data table.\n// Exact normalised match wins outright; otherwise keyword overlap decides.\nconst MATCH_THRESHOLD = 0.62;\nconst MIN_SHARED_KEYWORDS = 2;\n\nlet ctx = $('Normalize Message').first().json;\ntry {\n  const withImage = $('Attach Image Context').first().json;\n  if (withImage) {\n    ctx = { ...ctx, ...withImage };\n  }\n} catch (error) {\n  // Text-only message: the image branch never ran, so keep the base context.\n}\n\nconst askedKey = ctx.questionKey;\nconst askedWords = new Set(keywordsOf(ctx.question));\n\nfunction similarity(storedWords) {\n  if (!askedWords.size || !storedWords.size) return { score: 0, shared: 0 };\n  let shared = 0;\n  for (const word of askedWords) {\n    if (storedWords.has(word)) shared += 1;\n  }\n  const union = askedWords.size + storedWords.size - shared;\n  const jaccard = shared / union;\n  const coverage = shared / Math.min(askedWords.size, storedWords.size);\n  return { score: 0.5 * jaccard + 0.5 * coverage, shared };\n}\n\nconst scored = $input\n  .all()\n  .map((item) => item.json)\n  .filter((row) => row && row.answer && (row.question || row.question_key))\n  .map((row) => {\n    const storedWords = new Set(\n      row.keywords ? String(row.keywords).split(' ').filter(Boolean) : keywordsOf(row.question),\n    );\n    const exact = Boolean(askedKey) && row.question_key === askedKey;\n    const { score, shared } = similarity(storedWords);\n    return {\n      id: row.id ?? null,\n      question: row.question,\n      answer: row.answer,\n      hits: Number(row.hits ?? 0),\n      source: row.source ?? 'ai',\n      shared,\n      score: exact ? 1 : score,\n      exact,\n    };\n  })\n  .sort((a, b) => b.score - a.score);\n\nconst best = scored[0] ?? null;\n\n// A photo always goes to the vision model - a stored text answer cannot have seen it.\nconst kbHit = Boolean(best)\n  && !ctx.hasImage\n  && (best.exact || (best.score >= MATCH_THRESHOLD && best.shared >= MIN_SHARED_KEYWORDS));\n\nreturn [{\n  json: {\n    ...ctx,\n    kbHit,\n    kbAnswer: kbHit ? best.answer : null,\n    kbQuestion: kbHit ? best.question : null,\n    kbRowId: kbHit ? best.id : null,\n    kbHits: kbHit ? best.hits : 0,\n    kbScore: best ? Number(best.score.toFixed(3)) : 0,\n    kbRowsSearched: scored.length,\n    // Near misses still help the model answer in the community's own words.\n    kbCandidates: scored.slice(0, 3).map((c) => ({ question: c.question, answer: c.answer, score: c.score })),\n  },\n}];"
+      },
+      "id": "89726431-bd89-40fc-be51-d0e63548d48a",
+      "name": "Match Stored Question",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        300
+      ],
+      "notes": "Exact match, else keyword overlap >= 0.62. Photos always skip the cache."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "f0981595-c982-41dd-a55e-ae0c80d9bc1a",
+              "leftValue": "={{ $json.kbHit }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "9a9ebd04-9966-4d92-9ca8-de9c4c8c6fe4",
+      "name": "Answer in KB?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1300,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "function toTelegramMarkdown(input) {\n  let out = String(input ?? '').trim();\n\n  // Telegram's Markdown is not CommonMark: no tables, no ### headings, and bold is a\n  // SINGLE asterisk. Models emit all three anyway, so convert rather than strip.\n  const lines = out.split('\\n');\n  const rebuilt = [];\n  const cells = (line) => line.trim().replace(/^\\||\\|$/g, '').split('|').map((c) => c.trim());\n\n  for (let i = 0; i < lines.length; i += 1) {\n    const isRow = /^\\s*\\|.*\\|\\s*$/.test(lines[i]);\n    const isDivider = i + 1 < lines.length && /^\\s*\\|[\\s:|-]+\\|\\s*$/.test(lines[i + 1]);\n    if (isRow && isDivider) {\n      const head = cells(lines[i]);\n      i += 2;\n      while (i < lines.length && /^\\s*\\|.*\\|\\s*$/.test(lines[i])) {\n        const row = cells(lines[i]);\n        rebuilt.push('• ' + row[0]);\n        for (let c = 1; c < row.length; c += 1) {\n          if (row[c]) rebuilt.push('   ' + (head[c] ? head[c].replace(/\\*/g, '') + ': ' : '') + row[c]);\n        }\n        i += 1;\n      }\n      i -= 1;\n      rebuilt.push('');\n    } else {\n      rebuilt.push(lines[i]);\n    }\n  }\n  out = rebuilt.join('\\n');\n\n  out = out.replace(/^[ \\t]{0,3}#{1,6}[ \\t]*(.+?)[ \\t]*$/gm, (_, h) => '*' + h.replace(/[*_`#]/g, '').trim() + '*');\n  // No /s flag: bold never spans paragraphs, and pairing across them corrupts the text.\n  out = out.replace(/\\*\\*\\*([^*\\n]+?)\\*\\*\\*/g, '*$1*');\n  out = out.replace(/\\*\\*([^*\\n]+?)\\*\\*/g, '*$1*');\n  out = out.replace(/__([^_\\n]+?)__/g, '_$1_');\n  out = out.replace(/\\*\\*/g, '');  // anything left over is unpaired\n  out = out.replace(/^(\\s*)[*+-]\\s+/gm, '$1• ');\n  out = out.replace(/\\n{3,}/g, '\\n\\n');\n  return out.trim();\n}\n\nfunction safeMarkdown(input) {\n  let out = toTelegramMarkdown(input);\n  if (((out.match(/```/g) || []).length) % 2 === 1) out += '\\n```';\n  for (const ch of ['*', '_']) {\n    if ((out.split(ch).length - 1) % 2 === 1) out = out.split(ch).join('');\n  }\n  if (((out.replace(/```/g, '').match(/`/g) || []).length) % 2 === 1) out = out.replace(/`/g, '');\n  return out;\n}\n\nconst d = $input.first().json;\n\nconst timesAsked = Number(d.kbHits ?? 0) + 1;\nconst footer = '📚 Saved answer from our knowledge base'\n  + (timesAsked > 1 ? ' (asked ' + timesAsked + ' times)' : '');\n\nreturn [{\n  json: {\n    ...d,\n    source: 'kb',\n    model: null,\n    aiFailed: false,\n    answer: safeMarkdown(d.kbAnswer + '\\n\\n' + footer),\n  },\n}];"
+      },
+      "id": "5358ee82-1b0c-48de-b38b-d87aa50bb856",
+      "name": "Format Stored Answer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1520,
+        160
+      ],
+      "notes": "Reuses the stored answer - zero tokens spent."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Builds the OpenAI-compatible request body for the NVIDIA NIM endpoint.\n// Nemotron answers text; a vision model takes over when the question is a screenshot.\nconst TEXT_MODEL = 'nvidia/llama-3.3-nemotron-super-49b-v1';\nconst VISION_MODEL = 'meta/llama-3.2-90b-vision-instruct';\nconst MAX_TOKENS = 2048;\n\nconst d = $input.first().json;\n\nconst reference = (d.kbCandidates ?? [])\n  .filter((c) => c.score > 0.25)\n  .map((c, i) => '[' + (i + 1) + '] Q: ' + (c.question ?? 'n/a') + '\\nA: ' + c.answer)\n  .join('\\n\\n');\n\nconst systemPrompt = [\n  // Nemotron reasoning toggle - keep it off so replies arrive fast.\n  'detailed thinking off',\n  '',\n  'You are the answer bot for the \"' + (d.chatTitle || 'community') + '\" Telegram group, where members post',\n  'questions and assessment or exam questions and expect a correct, self-contained answer.',\n  '',\n  'Rules:',\n  '- Always answer in English.',\n  '- Give the complete answer. A one-line question gets a one-line answer; a problem that needs',\n  '  working, steps, or an example gets all of it. Do not pad and do not cut yourself short.',\n  '- For an assessment or exam question: state the final answer first, then show the reasoning',\n  '  or working underneath so the member can check it.',\n  '- For multiple choice: name the correct option and say why the others are wrong.',\n  '- If you are genuinely unsure, say so in one line and suggest the member tag a moderator.',\n  '  Never guess at a fact and present it as certain.',\n  '- Never invent URLs, citations, prices, version numbers, or credentials.',\n  '- Telegram formatting only: *single asterisks* for bold, `code`, ``` blocks.',\n  '- Never use tables, ### headings, or **double asterisks** - Telegram cannot render them.',\n  '',\n  reference\n    ? 'Previously answered questions from this community - reuse them when they fit:\\n' + reference\n    : 'No previously answered questions matched this one.',\n].join('\\n');\n\nconst userContent = d.hasImage\n  ? [\n      { type: 'text', text: d.question },\n      { type: 'image_url', image_url: { url: d.imageDataUrl } },\n    ]\n  : d.question;\n\nconst payload = {\n  model: d.hasImage ? VISION_MODEL : TEXT_MODEL,\n  messages: [\n    { role: 'system', content: systemPrompt },\n    { role: 'user', content: userContent },\n  ],\n  temperature: 0.2,\n  top_p: 0.9,\n  max_tokens: MAX_TOKENS,\n  stream: false,\n};\n\nreturn [{ json: { ...d, payload, model: payload.model } }];"
+      },
+      "id": "d380d17a-32b5-4f71-bcaf-4351e5dc0975",
+      "name": "Build AI Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1520,
+        440
+      ],
+      "notes": "English-only, full-length answers, exam questions get working shown."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.payload) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 120000
+        }
+      },
+      "id": "a1b55b0d-feaa-4187-9281-de0fc44916da",
+      "name": "NVIDIA Nemotron (NIM)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1740,
+        440
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "BIPFew7eH2iawpK0",
+          "name": "Header Auth account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "notes": "Header Auth credential: Authorization = Bearer nvapi-xxxxx"
+    },
+    {
+      "parameters": {
+        "jsCode": "function toTelegramMarkdown(input) {\n  let out = String(input ?? '').trim();\n\n  // Telegram's Markdown is not CommonMark: no tables, no ### headings, and bold is a\n  // SINGLE asterisk. Models emit all three anyway, so convert rather than strip.\n  const lines = out.split('\\n');\n  const rebuilt = [];\n  const cells = (line) => line.trim().replace(/^\\||\\|$/g, '').split('|').map((c) => c.trim());\n\n  for (let i = 0; i < lines.length; i += 1) {\n    const isRow = /^\\s*\\|.*\\|\\s*$/.test(lines[i]);\n    const isDivider = i + 1 < lines.length && /^\\s*\\|[\\s:|-]+\\|\\s*$/.test(lines[i + 1]);\n    if (isRow && isDivider) {\n      const head = cells(lines[i]);\n      i += 2;\n      while (i < lines.length && /^\\s*\\|.*\\|\\s*$/.test(lines[i])) {\n        const row = cells(lines[i]);\n        rebuilt.push('• ' + row[0]);\n        for (let c = 1; c < row.length; c += 1) {\n          if (row[c]) rebuilt.push('   ' + (head[c] ? head[c].replace(/\\*/g, '') + ': ' : '') + row[c]);\n        }\n        i += 1;\n      }\n      i -= 1;\n      rebuilt.push('');\n    } else {\n      rebuilt.push(lines[i]);\n    }\n  }\n  out = rebuilt.join('\\n');\n\n  out = out.replace(/^[ \\t]{0,3}#{1,6}[ \\t]*(.+?)[ \\t]*$/gm, (_, h) => '*' + h.replace(/[*_`#]/g, '').trim() + '*');\n  // No /s flag: bold never spans paragraphs, and pairing across them corrupts the text.\n  out = out.replace(/\\*\\*\\*([^*\\n]+?)\\*\\*\\*/g, '*$1*');\n  out = out.replace(/\\*\\*([^*\\n]+?)\\*\\*/g, '*$1*');\n  out = out.replace(/__([^_\\n]+?)__/g, '_$1_');\n  out = out.replace(/\\*\\*/g, '');  // anything left over is unpaired\n  out = out.replace(/^(\\s*)[*+-]\\s+/gm, '$1• ');\n  out = out.replace(/\\n{3,}/g, '\\n\\n');\n  return out.trim();\n}\n\nfunction safeMarkdown(input) {\n  let out = toTelegramMarkdown(input);\n  if (((out.match(/```/g) || []).length) % 2 === 1) out += '\\n```';\n  for (const ch of ['*', '_']) {\n    if ((out.split(ch).length - 1) % 2 === 1) out = out.split(ch).join('');\n  }\n  if (((out.replace(/```/g, '').match(/`/g) || []).length) % 2 === 1) out = out.replace(/`/g, '');\n  return out;\n}\n\n// Drop the request body from the item - it can carry a large base64 image.\nconst { payload, ...d } = $('Build AI Prompt').first().json;\nconst res = $input.first()?.json ?? {};\n\nlet answer = res?.choices?.[0]?.message?.content ?? '';\nif (Array.isArray(answer)) {\n  answer = answer.map((part) => part.text ?? '').join('');\n}\n\n// Nemotron can emit reasoning traces when \"detailed thinking\" is on - never ship those.\nanswer = String(answer).replace(/<think>[\\s\\S]*?<\\/think>/gi, '').trim();\n\nconst truncated = res?.choices?.[0]?.finish_reason === 'length';\nconst aiFailed = answer.length === 0;\nif (aiFailed) {\n  answer = 'I could not generate an answer right now. A moderator will pick this up shortly. 🙇';\n}\n\nreturn [{\n  json: {\n    ...d,\n    source: 'ai',\n    aiFailed,\n    truncated,\n    apiError: res.error ?? res.detail ?? null,\n    usage: res.usage ?? null,\n    answer: safeMarkdown(answer),\n  },\n}];"
+      },
+      "id": "28255451-e3b4-42bd-8d13-4bee1817c126",
+      "name": "Parse AI Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1960,
+        440
+      ],
+      "notes": "Strips <think> traces and repairs Markdown."
+    },
+    {
+      "parameters": {
+        "numberInputs": 2
+      },
+      "id": "fbda7f27-3e56-49f2-b955-e04ec05ba63d",
+      "name": "Merge Answer",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        2180,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "function toTelegramMarkdown(input) {\n  let out = String(input ?? '').trim();\n\n  // Telegram's Markdown is not CommonMark: no tables, no ### headings, and bold is a\n  // SINGLE asterisk. Models emit all three anyway, so convert rather than strip.\n  const lines = out.split('\\n');\n  const rebuilt = [];\n  const cells = (line) => line.trim().replace(/^\\||\\|$/g, '').split('|').map((c) => c.trim());\n\n  for (let i = 0; i < lines.length; i += 1) {\n    const isRow = /^\\s*\\|.*\\|\\s*$/.test(lines[i]);\n    const isDivider = i + 1 < lines.length && /^\\s*\\|[\\s:|-]+\\|\\s*$/.test(lines[i + 1]);\n    if (isRow && isDivider) {\n      const head = cells(lines[i]);\n      i += 2;\n      while (i < lines.length && /^\\s*\\|.*\\|\\s*$/.test(lines[i])) {\n        const row = cells(lines[i]);\n        rebuilt.push('• ' + row[0]);\n        for (let c = 1; c < row.length; c += 1) {\n          if (row[c]) rebuilt.push('   ' + (head[c] ? head[c].replace(/\\*/g, '') + ': ' : '') + row[c]);\n        }\n        i += 1;\n      }\n      i -= 1;\n      rebuilt.push('');\n    } else {\n      rebuilt.push(lines[i]);\n    }\n  }\n  out = rebuilt.join('\\n');\n\n  out = out.replace(/^[ \\t]{0,3}#{1,6}[ \\t]*(.+?)[ \\t]*$/gm, (_, h) => '*' + h.replace(/[*_`#]/g, '').trim() + '*');\n  // No /s flag: bold never spans paragraphs, and pairing across them corrupts the text.\n  out = out.replace(/\\*\\*\\*([^*\\n]+?)\\*\\*\\*/g, '*$1*');\n  out = out.replace(/\\*\\*([^*\\n]+?)\\*\\*/g, '*$1*');\n  out = out.replace(/__([^_\\n]+?)__/g, '_$1_');\n  out = out.replace(/\\*\\*/g, '');  // anything left over is unpaired\n  out = out.replace(/^(\\s*)[*+-]\\s+/gm, '$1• ');\n  out = out.replace(/\\n{3,}/g, '\\n\\n');\n  return out.trim();\n}\n\nfunction safeMarkdown(input) {\n  let out = toTelegramMarkdown(input);\n  if (((out.match(/```/g) || []).length) % 2 === 1) out += '\\n```';\n  for (const ch of ['*', '_']) {\n    if ((out.split(ch).length - 1) % 2 === 1) out = out.split(ch).join('');\n  }\n  if (((out.replace(/```/g, '').match(/`/g) || []).length) % 2 === 1) out = out.replace(/`/g, '');\n  return out;\n}\n\n// Telegram hard-caps a message at 4096 characters, so a long answer becomes several\n// messages split on paragraph -> line -> sentence -> word boundaries, in order.\nconst MAX_CHARS = 3800;\n\nconst d = $input.first().json;\n\nfunction splitAnswer(text) {\n  const chunks = [];\n  let rest = String(text ?? '').trim();\n\n  while (rest.length > MAX_CHARS) {\n    const window = rest.slice(0, MAX_CHARS);\n    let cut = -1;\n    for (const marker of ['\\n\\n', '\\n', '. ', ' ']) {\n      cut = window.lastIndexOf(marker);\n      if (cut > MAX_CHARS * 0.5) {\n        cut += marker === '. ' ? 1 : 0;\n        break;\n      }\n      cut = -1;\n    }\n    if (cut <= 0) cut = MAX_CHARS;\n    chunks.push(rest.slice(0, cut).trim());\n    rest = rest.slice(cut).trim();\n  }\n  if (rest.length) chunks.push(rest);\n  return chunks.length ? chunks : ['(empty answer)'];\n}\n\nconst parts = splitAnswer(d.answer);\n\nreturn parts.map((part, index) => ({\n  json: {\n    ...d,\n    chunk: safeMarkdown(parts.length > 1\n      ? part + '\\n\\n(' + (index + 1) + '/' + parts.length + ')'\n      : part),\n    chunkIndex: index,\n    chunkCount: parts.length,\n  },\n}));"
+      },
+      "id": "098981d1-c0a7-46c5-ac51-43dcfe6b447d",
+      "name": "Split Long Answer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2400,
+        300
+      ],
+      "notes": "Telegram caps messages at 4096 chars - long answers become several messages."
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.chunk }}",
+        "replyMarkup": "none",
+        "additionalFields": {
+          "reply_to_message_id": "={{ $json.messageId }}",
+          "parse_mode": "Markdown",
+          "disable_web_page_preview": true,
+          "appendAttribution": false
+        }
+      },
+      "id": "1fba8556-3a15-459d-b6e4-966230202a7d",
+      "name": "Send Telegram Reply",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2620,
+        300
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "KpkZ9HKF5DscHg2o",
+          "name": "Telegram account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "One message per chunk, each a threaded reply to the question."
+    },
+    {
+      "parameters": {
+        "maxItems": 1,
+        "keep": "firstItems"
+      },
+      "id": "e6a4adb5-588d-4814-ab58-e0b38c76afaf",
+      "name": "Keep One Item",
+      "type": "n8n-nodes-base.limit",
+      "typeVersion": 1,
+      "position": [
+        2840,
+        300
+      ],
+      "notes": "A 3-part answer must still write exactly one KB row."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "69665e3b-3fac-48f6-b94a-8b51d11ff70c",
+              "leftValue": "={{ $('Merge Answer').first().json.source }}",
+              "rightValue": "ai",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "a0d9ebf7-a77c-4843-a0d5-25576dfe5b1b",
+              "leftValue": "={{ $('Merge Answer').first().json.aiFailed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "e00e9b25-75d2-488a-ba77-d03f6e85e188",
+      "name": "Was It a Fresh AI Answer?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3060,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "qa_knowledge_base"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "question": "={{ $('Merge Answer').first().json.question }}",
+            "question_key": "={{ $('Merge Answer').first().json.questionKey }}",
+            "answer": "={{ $('Merge Answer').first().json.answer }}",
+            "keywords": "={{ $('Merge Answer').first().json.keywords }}",
+            "source": "ai",
+            "hits": 0
+          },
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "81478274-554d-4477-9937-b2b86bac50f9",
+      "name": "Save Answer to KB",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        3280,
+        200
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "The knowledge base builds itself from every AI answer."
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "qa_knowledge_base"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "id",
+              "condition": "eq",
+              "keyValue": "={{ $('Merge Answer').first().json.kbRowId }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "hits": "={{ $('Merge Answer').first().json.kbHits + 1 }}"
+          },
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "741753d7-edea-4c16-b20d-6e345d65b118",
+      "name": "Count Reuse",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        3280,
+        400
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Tracks which stored answers people keep needing."
+    },
+    {
+      "parameters": {
+        "content": "## ① Run this once\n\nClick the **Create KB Table** node → *Test step*.\n\nIt creates a data table called `qa_knowledge_base` — the bot's memory. It starts empty and fills itself as questions get answered.\n\nYou can browse and edit it any time under **Data tables** in the left sidebar. Fixing a wrong answer there fixes it for everyone who asks next.",
+        "height": 240,
+        "width": 460,
+        "color": 7
+      },
+      "id": "536d220b-acda-4d62-b90a-0c3ec5ac8504",
+      "name": "Sticky Note 1",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -470,
+        -320
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## ② How it connects\n\nNo webhook, no tunnel, nothing on this machine is exposed to the internet. n8n **asks** Telegram for new messages every 30 seconds (long-polling, so a reply normally lands in about a second).\n\n**n8n must be started like this:**\n```\nN8N_BLOCK_ENV_ACCESS_IN_NODE=false \\\nTELEGRAM_BOT_TOKEN=123456:AA... \\\nn8n start\n```\nThe token lives in the environment, never inside this workflow.",
+        "height": 360,
+        "width": 520,
+        "color": 7
+      },
+      "id": "8e68c702-3d38-47d6-80e4-3d0e139499bd",
+      "name": "Sticky Note 2",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1130,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## ③ How to ask\n\nThe bot answers when it is **spoken to directly**:\n• `/ask your question`\n• `@nexushelper421bot your question`\n• replying to one of its own answers\n• a photo sent with `/ask` in the caption\n\nTelegram delivers exactly these three to a bot even with **privacy mode ON**, so nothing needs changing in BotFather — and the bot never receives ordinary group conversation.\n\n**Want it to answer bare questions too?** Make the bot a group admin (or `/setprivacy` → Disable + re-add it), then set `ANSWER_ANY_QUESTION = true` at the top of **Normalize Message**.",
+        "height": 380,
+        "width": 460,
+        "color": 5
+      },
+      "id": "cdf80ab1-0ecb-4ac2-ab91-79235bf9a9a9",
+      "name": "Sticky Note 3",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -20,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## ④ Photos\n\nA member can photograph an assessment question and send it. The largest resolution is downloaded and passed to a vision model.\n\n⚠️ Images over ~175 KB can't be inlined into NVIDIA's API, so those fall back to answering from the caption.",
+        "height": 260,
+        "width": 420,
+        "color": 5
+      },
+      "id": "3d1295f8-dde0-4f59-8101-b6b42db3a1e9",
+      "name": "Sticky Note 4",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        420,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## ⑤ Memory first, AI second\n\nEvery stored question is compared to the new one: exact match wins, otherwise keyword overlap must beat **0.62**.\n\nHit → the stored answer is sent, no API call, instant and free.\nMiss → Nemotron answers, and the answer is saved so the *next* person gets it free.\n\nPhotos always skip the cache.",
+        "height": 320,
+        "width": 460,
+        "color": 4
+      },
+      "id": "c28180e7-c0fe-4d6d-a38d-8754b4e26ce4",
+      "name": "Sticky Note 5",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        860,
+        -200
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## ⑥ Answers can be any length\n\nNo word limit in the prompt (`max_tokens` 2048). Telegram caps a message at 4096 characters, so **Split Long Answer** breaks a long reply at paragraph boundaries and sends it as `(1/3)`, `(2/3)`, `(3/3)`.\n\nExam questions get the final answer first, then the working.",
+        "height": 300,
+        "width": 460,
+        "color": 3
+      },
+      "id": "7489ca80-7ce8-47b2-a08c-e03ce5d208af",
+      "name": "Sticky Note 6",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2400,
+        -200
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## ⑦ It teaches itself\n\nAfter replying: a fresh AI answer is written into the data table, and a reused answer just bumps its `hits` counter — so you can see what your community keeps asking.",
+        "height": 220,
+        "width": 440,
+        "color": 6
+      },
+      "id": "4be930eb-b076-4f0e-99f1-ebd241040146",
+      "name": "Sticky Note 7",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        3060,
+        560
+      ]
+    }
+  ],
+  "connections": {
+    "▶ Click here once, first time only": {
+      "main": [
+        [
+          {
+            "node": "Create KB Table",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every 30 Seconds": {
+      "main": [
+        [
+          {
+            "node": "Read Saved Offset",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Saved Offset": {
+      "main": [
+        [
+          {
+            "node": "Get Telegram Updates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Telegram Updates": {
+      "main": [
+        [
+          {
+            "node": "Confirm & Emit Updates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confirm & Emit Updates": {
+      "main": [
+        [
+          {
+            "node": "Normalize Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Message": {
+      "main": [
+        [
+          {
+            "node": "Is This a Question?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is This a Question?": {
+      "main": [
+        [
+          {
+            "node": "Send Typing Action",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Has Photo?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Not a Question - Ignore",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Photo?": {
+      "main": [
+        [
+          {
+            "node": "Download Telegram Photo",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Search Knowledge Base",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download Telegram Photo": {
+      "main": [
+        [
+          {
+            "node": "Attach Image Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Image Context": {
+      "main": [
+        [
+          {
+            "node": "Search Knowledge Base",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Knowledge Base": {
+      "main": [
+        [
+          {
+            "node": "Match Stored Question",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Match Stored Question": {
+      "main": [
+        [
+          {
+            "node": "Answer in KB?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Answer in KB?": {
+      "main": [
+        [
+          {
+            "node": "Format Stored Answer",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build AI Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Stored Answer": {
+      "main": [
+        [
+          {
+            "node": "Merge Answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build AI Prompt": {
+      "main": [
+        [
+          {
+            "node": "NVIDIA Nemotron (NIM)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "NVIDIA Nemotron (NIM)": {
+      "main": [
+        [
+          {
+            "node": "Parse AI Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse AI Response": {
+      "main": [
+        [
+          {
+            "node": "Merge Answer",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Answer": {
+      "main": [
+        [
+          {
+            "node": "Split Long Answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Long Answer": {
+      "main": [
+        [
+          {
+            "node": "Send Telegram Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Telegram Reply": {
+      "main": [
+        [
+          {
+            "node": "Keep One Item",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Keep One Item": {
+      "main": [
+        [
+          {
+            "node": "Was It a Fresh AI Answer?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Was It a Fresh AI Answer?": {
+      "main": [
+        [
+          {
+            "node": "Save Answer to KB",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Count Reuse",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "executionTimeout": 300,
+    "timezone": "UTC"
+  },
+  "staticData": null,
+  "tags": [],
+  "versionId": "e36c50b4-611d-4ea5-b540-6140dd75357f",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}
